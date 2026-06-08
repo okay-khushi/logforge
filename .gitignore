@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# ML Models (large binaries - store in S3)
+ml/models/*.pkl
+ml/models/*.joblib
+
+# Node / React
+node_modules/
+frontend/build/
+frontend/dist/
+.npm
+
+# Docker
+.docker/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# AWS
+.aws/
+terraform.tfstate
+terraform.tfstate.backup
+.terraform/
+
+# Secrets (never commit these!)
+*.pem
+*.key
+*.crt
+credentials.json

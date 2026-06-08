@@ -1,0 +1,133 @@
+# Docker Compose — LogForge Local Development
+# Phase 1: Infrastructure services only (Elasticsearch + Kafka + Zookeeper)
+# Full application services added in Phase 10
+
+version: "3.9"
+
+services:
+
+  # ─── Elasticsearch ─────────────────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: logforge-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false        # Disable auth for local dev
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m     # Limit memory for local dev
+      - cluster.name=logforge-cluster
+    ports:
+      - "9200:9200"   # REST API
+      - "9300:9300"   # Node-to-node communication
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - logforge-net
+
+  # ─── Kibana (Elasticsearch UI — helpful for debugging) ─────────────────────
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: logforge-kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - logforge-net
+
+  # ─── Zookeeper (required by Kafka) ─────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: logforge-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    networks:
+      - logforge-net
+
+  # ─── Kafka ─────────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: logforge-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"   # External access from host machine
+      - "9101:9101"   # JMX metrics
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - logforge-net
+
+  # ─── Kafka UI (browse topics and messages visually) ─────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: logforge-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: logforge
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - logforge-net
+
+  # ─── PostgreSQL (alerts & rules metadata) ──────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: logforge-postgres
+    environment:
+      POSTGRES_DB: logforge
+      POSTGRES_USER: logforge
+      POSTGRES_PASSWORD: logforge_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logforge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - logforge-net
+
+# ─── Persistent Volumes ──────────────────────────────────────────────────────
+volumes:
+  elasticsearch_data:
+    driver: local
+  zookeeper_data:
+    driver: local
+  zookeeper_logs:
+    driver: local
+  kafka_data:
+    driver: local
+  postgres_data:
+    driver: local
+
+# ─── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  logforge-net:
+    driver: bridge
