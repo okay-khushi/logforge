@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LogForge Backend — Python Dependencies
+# Install with: pip install -r requirements.txt
+# Compatible with Python 3.11 - 3.14
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Web Framework ─────────────────────────────────────────────────────────────
+fastapi>=0.111.0          # Async web framework with auto-generated docs
+uvicorn[standard]>=0.29.0 # ASGI server to run FastAPI
+python-multipart>=0.0.9   # Required for file upload support in FastAPI
+
+# ── Settings & Environment ────────────────────────────────────────────────────
+pydantic>=2.7.1           # Data validation (FastAPI uses this internally)
+pydantic-settings>=2.2.1  # Load settings from .env files with Pydantic v2
+python-dotenv>=1.0.1      # Read .env files into environment variables
+
+# ── Elasticsearch ─────────────────────────────────────────────────────────────
+elasticsearch[async]>=8.13.0  # Official async Elasticsearch client for Python
+
+# ── Kafka ─────────────────────────────────────────────────────────────────────
+aiokafka>=0.10.0          # Async Kafka client (producer + consumer)
+
+# ── Database (PostgreSQL for alerts/rules) ────────────────────────────────────
+sqlalchemy>=2.0.30        # ORM for database access
+asyncpg>=0.29.0           # Async PostgreSQL driver (used by SQLAlchemy async)
+alembic>=1.13.1           # Database migration tool
+
+# ── Machine Learning ──────────────────────────────────────────────────────────
+# Note: Using >= to allow pip to resolve compatible versions for your Python version
+scikit-learn>=1.4.0       # Isolation Forest anomaly detection
+numpy>=1.26.0             # Numerical arrays (required by scikit-learn)
+joblib>=1.4.0             # Save/load trained ML models
+
+# ── HTTP & Utilities ──────────────────────────────────────────────────────────
+httpx>=0.27.0             # Async HTTP client (used in tests + health checks)
+python-jose[cryptography]>=3.3.0  # JWT token handling (future auth)
+passlib[bcrypt]>=1.7.4    # Password hashing (future auth)
+
+# ── Observability ─────────────────────────────────────────────────────────────
+prometheus-fastapi-instrumentator>=6.1.0  # Auto-generates /metrics endpoint
+structlog>=24.1.0         # Structured (JSON) logging
+
+# ── Email (alert notifications) ───────────────────────────────────────────────
+aiosmtplib>=3.0.1         # Async SMTP for sending alert emails
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.2.0             # Test runner
+pytest-asyncio>=0.23.6    # Async test support for FastAPI
+anyio>=4.3.0              # Required by pytest-asyncio
+
+# ── Code Quality ──────────────────────────────────────────────────────────────
+ruff>=0.4.4               # Fast Python linter (replaces flake8, isort, pyflakes)
+black>=24.4.2             # Code formatter
