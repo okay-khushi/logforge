@@ -57,7 +57,7 @@ class Settings(BaseSettings):
 
     # ── Elasticsearch ─────────────────────────────────────────────────────────
     elasticsearch_url: str = Field(
-        default="http://localhost:9200",
+        default="http://elasticsearch:9200",
         description="Elasticsearch connection URL",
     )
     elasticsearch_index_prefix: str = Field(

@@ -1,6 +1,8 @@
 """
 api/v1/health.py — Health Check Endpoints
 
+Phase 3 Update: Added real Elasticsearch connectivity checks.
+
 WHY HEALTH ENDPOINTS MATTER:
     Every production system needs health checks for:
     1. Load balancers (AWS ALB, Nginx) — decides whether to route traffic here
@@ -16,9 +18,6 @@ WHY HEALTH ENDPOINTS MATTER:
     TWO STANDARD ENDPOINTS:
     - /health/live  — "Is the process running?" (Kubernetes liveness probe)
     - /health/ready — "Can the process handle traffic?" (Kubernetes readiness probe)
-
-    The distinction matters during startup: a process is ALIVE (not crashed)
-    before it's READY (all connections established, warmed up).
 """
 
 from datetime import datetime, timezone
@@ -27,7 +26,10 @@ from fastapi import APIRouter, Depends
 
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
-from app.services.log_store import InMemoryLogStore, get_log_store
+from app.services.elasticsearch_client import get_cluster_health, ping_elasticsearch
+from app.services.kafka_producer import check_kafka_health
+from app.services.kafka_consumer import is_consumer_running
+from app.services.log_store import get_log_store
 
 logger = get_logger(__name__)
 
@@ -40,22 +42,29 @@ router = APIRouter(
 @router.get(
     "",
     summary="Full health check",
-    description="Returns the health status of all connected services.",
+    description="Returns the health status of all connected services including Elasticsearch.",
 )
 async def health_check(
-    store: InMemoryLogStore = Depends(get_log_store),
+    store=Depends(get_log_store),
     settings: Settings = Depends(get_settings),
 ) -> dict:
     """
     Comprehensive health check.
-    Checks every dependency: log store, (Elasticsearch in Phase 3), (Kafka in Phase 4).
+    Checks: log store, Elasticsearch cluster.
     """
     store_health = await store.health_check()
 
-    # Phase 3: add elasticsearch health check here
-    # Phase 4: add kafka health check here
+    # Real Elasticsearch health check (Phase 3)
+    es_health = await get_cluster_health()
 
-    overall_status = "healthy" if store_health["status"] == "healthy" else "degraded"
+    # Real Kafka health check (Phase 4)
+    kafka_health = await check_kafka_health()
+    kafka_ok = kafka_health.get("status") == "connected"
+
+    # Determine overall status
+    es_ok = es_health.get("status") in ("green", "yellow", "healthy")
+    store_ok = store_health.get("status") == "healthy"
+    overall_status = "healthy" if (store_ok and es_ok) else "degraded"
 
     health_response = {
         "status": overall_status,
@@ -64,12 +73,15 @@ async def health_check(
         "environment": settings.app_env,
         "services": {
             "log_store": store_health,
-            "elasticsearch": "not_connected_until_phase_3",
-            "kafka": "not_connected_until_phase_4",
+            "elasticsearch": es_health,
+            "kafka": {
+                **kafka_health,
+                "consumer_running": is_consumer_running(),
+            },
         },
     }
 
-    logger.info("Health check", status=overall_status)
+    logger.info("Health check", status=overall_status, es_status=es_health.get("status"))
 
     return health_response
 
@@ -87,22 +99,28 @@ async def liveness() -> dict:
 @router.get(
     "/ready",
     summary="Readiness probe",
-    description="Returns 200 if the service is ready to accept traffic.",
+    description="Returns 200 if the service is ready. Checks Elasticsearch connectivity.",
 )
 async def readiness(
-    store: InMemoryLogStore = Depends(get_log_store),
+    store=Depends(get_log_store),
 ) -> dict:
     """
-    Readiness check — verifies dependencies are available.
-    In Phase 3 this will also verify Elasticsearch connectivity.
+    Readiness check — verifies Elasticsearch is reachable.
+    Returns 503 if ES is not available (prevents traffic routing to unhealthy instance).
     """
     store_health = await store.health_check()
-    is_ready = store_health["status"] == "healthy"
+    es_reachable = await ping_elasticsearch()
+    kafka_health = await check_kafka_health()
+
+    is_ready = store_health.get("status") == "healthy"
 
     return {
         "status": "ready" if is_ready else "not_ready",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "checks": {
-            "log_store": store_health["status"],
+            "log_store": store_health.get("status"),
+            "elasticsearch": "connected" if es_reachable else "unreachable",
+            "kafka": kafka_health.get("status"),
+            "consumer": "running" if is_consumer_running() else "stopped",
         },
     }

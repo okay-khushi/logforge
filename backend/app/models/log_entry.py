@@ -79,6 +79,13 @@ class LogEntryInput(BaseModel):
         description="Optional key-value pairs for additional context",
         examples=[{"user_id": "u123", "request_id": "req-456"}],
     )
+    environment: str = Field(
+        default="production",
+        min_length=1,
+        max_length=50,
+        description="Deployment environment (production, staging, development)",
+        examples=["production"],
+    )
 
     @field_validator("timestamp", mode="before")
     @classmethod
@@ -129,6 +136,7 @@ class LogEntryInput(BaseModel):
                 "service": "auth-service",
                 "host": "prod-server-01",
                 "message": "Failed to connect to database after 3 retries",
+                "environment": "production",
                 "metadata": {"user_id": "u123", "request_id": "req-456"},
             }
         }
@@ -174,6 +182,10 @@ class LogEntryStored(BaseModel):
     host: str
     message: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+    environment: str = Field(
+        default="production",
+        description="Deployment environment: production | staging | development",
+    )
     anomaly_score: float = Field(
         default=0.0,
         ge=0.0,
@@ -201,6 +213,7 @@ class LogEntryStored(BaseModel):
             "service": self.service,
             "host": self.host,
             "message": self.message,
+            "environment": self.environment,
             "metadata": self.metadata,
             "anomaly_score": self.anomaly_score,
             "is_anomaly": self.is_anomaly,
@@ -219,6 +232,7 @@ class LogEntryStored(BaseModel):
             service=entry.service,
             host=entry.host,
             message=entry.message,
+            environment=entry.environment,
             metadata=entry.metadata,
         )
 

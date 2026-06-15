@@ -40,6 +40,15 @@ from app.core.logging import configure_logging, get_logger
 configure_logging()
 logger = get_logger(__name__)
 
+# ─── Phase 3 imports ──────────────────────────────────────────────────────────
+from app.services.elasticsearch_client import close_es_client, get_cluster_health, get_es_client, ping_elasticsearch
+from app.services.elasticsearch_store import ElasticsearchLogStore
+from app.services.log_store import InMemoryLogStore, set_active_store
+
+# ─── Phase 4 imports ──────────────────────────────────────────────────────────
+from app.services.kafka_producer import start_producer, stop_producer
+from app.services.kafka_consumer import start_consumer, stop_consumer
+
 
 # ─── Lifespan Context Manager ─────────────────────────────────────────────────
 @asynccontextmanager
@@ -59,8 +68,50 @@ async def lifespan(app: FastAPI):
         debug=settings.debug,
     )
 
-    # Phase 3: Initialize Elasticsearch connection pool here
-    # Phase 4: Initialize Kafka producer here
+    # ── Phase 3: Initialize Elasticsearch ────────────────────────────────────
+    es_available = await ping_elasticsearch()
+
+    if es_available:
+        logger.info(
+            "Elasticsearch connected",
+            url=settings.elasticsearch_url,
+        )
+        # Create the ES-backed store and register the index template
+        es_client = get_es_client()
+        es_store = ElasticsearchLogStore(client=es_client)
+        await es_store.ensure_index_template()
+        set_active_store(es_store)
+        logger.info("Using ElasticsearchLogStore as active store")
+    else:
+        logger.warning(
+            "Elasticsearch not reachable — falling back to InMemoryLogStore",
+            url=settings.elasticsearch_url,
+            hint="Start Elasticsearch with: docker-compose -f infrastructure/docker-compose.yml up -d elasticsearch",
+        )
+        set_active_store(InMemoryLogStore())
+
+    # ── Phase 4: Initialize Kafka Producer ────────────────────────────────────
+    # Start producer BEFORE consumer so the API can immediately publish
+    try:
+        await start_producer()
+    except Exception as e:
+        logger.warning(
+            "Kafka producer failed to start — ingestion will write directly to ES",
+            error=str(e),
+        )
+
+    # ── Phase 4: Initialize Kafka Consumer ───────────────────────────────────
+    # Consumer needs the active log store to write ES — start after store is set
+    active_store = set_active_store.__self__ if hasattr(set_active_store, '__self__') else None
+    from app.services.log_store import get_log_store
+    try:
+        await start_consumer(get_log_store())
+    except Exception as e:
+        logger.warning(
+            "Kafka consumer failed to start — logs must be ingested directly to ES",
+            error=str(e),
+        )
+
     # Phase 8: Load ML model here
 
     logger.info("LogForge API ready to serve requests", port=settings.api_port)
@@ -70,8 +121,12 @@ async def lifespan(app: FastAPI):
     # ── SHUTDOWN ──────────────────────────────────────────────────────────────
     logger.info("LogForge API shutting down gracefully")
 
-    # Phase 3: Close Elasticsearch connection pool here
-    # Phase 4: Flush and close Kafka producer here
+    # Phase 3: Close Elasticsearch connection pool
+    await close_es_client()
+
+    # ── Phase 4: Stop Kafka Producer and Consumer ───────────────────────────
+    await stop_consumer()
+    await stop_producer()
 
     logger.info("Shutdown complete")
 

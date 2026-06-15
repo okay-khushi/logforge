@@ -1,36 +1,44 @@
 """
 api/v1/ingest.py — Log Ingestion Endpoints
 
-WHAT THIS FILE DOES:
-    Handles POST requests to ingest log entries.
-    This is the "write path" of the system.
+Phase 4 Update: Ingestion now publishes to Kafka.
+                The consumer reads from Kafka and writes to Elasticsearch.
 
-ROUTE: POST /api/v1/ingest
+NEW FLOW:
+    POST /api/v1/ingest
+        ↓ Validate batch with Pydantic
+        ↓ Publish each log to Kafka topic "raw-logs"
+        ↓ Return 202 Accepted immediately
+        
+    (background)
+    Kafka Consumer polls "raw-logs"
+        ↓ Deserialize + validate
+        ↓ Bulk write to Elasticsearch
 
-DESIGN DECISIONS:
-    1. Batch ingestion only — no single-log endpoint.
-       Reason: Forces clients to batch, which is more efficient.
+FALLBACK STRATEGY:
+    If Kafka is unavailable (e.g., broker down), the ingest endpoint falls back
+    to writing directly to Elasticsearch. This keeps the API resilient — logs
+    are never silently dropped even if the streaming pipeline is degraded.
 
-    2. Partial failure handling — if 2 of 100 logs in a batch have bad data,
-       we accept the 98 valid ones and report the 2 failures.
-       Reason: Dropping an entire batch because of one bad entry would cause
-       data loss in a production logging system.
+    Priority:
+    1. Kafka → Consumer → Elasticsearch  (normal path)
+    2. Direct → Elasticsearch            (Kafka unavailable)
+    3. HTTP 500                          (both unavailable)
 
-    3. Background indexing — the API returns immediately after publishing
-       to Kafka (Phase 4). The consumer indexes asynchronously.
-       Reason: The client doesn't need to wait for Elasticsearch to finish.
-
-    4. Background tasks in Phase 2 — we store synchronously (in-memory)
-       but wrap it in a FastAPI BackgroundTask to simulate async behavior.
+WHY 202 ACCEPTED (not 200 OK)?
+    200 OK means "done". But the log isn't in ES yet — it's in Kafka.
+    202 Accepted means "I've accepted your request and will process it".
+    This is semantically correct for async/queued processing.
 """
 
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.logging import get_logger
 from app.models.log_entry import IngestResponse, LogBatchInput
-from app.services.log_store import InMemoryLogStore, get_log_store
+from app.services.kafka_producer import get_producer, produce_log_batch
+from app.services.log_store import get_log_store
 
 logger = get_logger(__name__)
 
@@ -46,28 +54,22 @@ router = APIRouter(
     status_code=status.HTTP_202_ACCEPTED,
     summary="Ingest a batch of log entries",
     description="""
-    Accepts a batch of 1-1000 log entries and stores them for search and analysis.
+    Accepts a batch of 1-1000 log entries and queues them for processing.
 
-    **Returns 202 Accepted** (not 200 OK) because the logs may be queued for
-    asynchronous processing via Kafka before reaching Elasticsearch.
+    **Phase 4 Flow**: Logs are published to a Kafka topic and consumed
+    asynchronously by the log consumer service, which writes them to Elasticsearch.
 
-    Each log entry requires: `timestamp`, `level`, `service`, `host`, `message`.
-    The `metadata` field is optional and accepts any JSON object.
+    **Fallback**: If Kafka is unavailable, logs are written directly to Elasticsearch.
+
+    Returns **202 Accepted** because indexing happens asynchronously.
     """,
 )
 async def ingest_logs(
     batch: LogBatchInput,
-    background_tasks: BackgroundTasks,
-    store: InMemoryLogStore = Depends(get_log_store),
+    store=Depends(get_log_store),
 ) -> IngestResponse:
     """
-    Ingest a batch of log entries.
-
-    FastAPI automatically:
-    - Parses the JSON body into LogBatchInput
-    - Validates every field in every LogEntryInput
-    - Returns HTTP 422 if validation fails (before this function runs)
-    - Generates the OpenAPI documentation from the type hints
+    Ingest a batch of log entries via Kafka (with direct-ES fallback).
     """
     batch_id = str(uuid4())
 
@@ -77,11 +79,71 @@ async def ingest_logs(
         log_count=len(batch.logs),
     )
 
+    # ── Attempt Kafka path ─────────────────────────────────────────────────────
+    producer = get_producer()
+
+    if producer is not None:
+        # Serialize each validated log entry to a plain dict for Kafka.
+        # We serialize AFTER Pydantic validation — the consumer receives
+        # clean, validated data (not raw client JSON).
+        log_dicts = [
+            {
+                "timestamp": log.timestamp.isoformat(),
+                "level": log.level.value if hasattr(log.level, "value") else log.level,
+                "service": log.service,
+                "host": log.host,
+                "message": log.message,
+                "environment": log.environment,
+                "metadata": log.metadata,
+            }
+            for log in batch.logs
+        ]
+
+        try:
+            sent = await produce_log_batch(log_dicts, batch_id)
+
+            if sent == len(batch.logs):
+                # All messages published to Kafka successfully
+                logger.info(
+                    "Batch published to Kafka",
+                    batch_id=batch_id,
+                    count=sent,
+                    path="kafka",
+                )
+                return IngestResponse(
+                    status="accepted",
+                    ingested=sent,
+                    batch_id=batch_id,
+                )
+            elif sent > 0:
+                # Partial Kafka publish — fall through to write remainder directly
+                logger.warning(
+                    "Partial Kafka publish — falling back to direct ES for remainder",
+                    batch_id=batch_id,
+                    kafka_sent=sent,
+                    total=len(batch.logs),
+                )
+        except Exception as e:
+            logger.warning(
+                "Kafka publish failed — falling back to direct ES write",
+                batch_id=batch_id,
+                error=str(e),
+            )
+
+    # ── Fallback: Direct Elasticsearch write ───────────────────────────────────
+    # Reached when: Kafka is down, producer not initialized, or partial failure.
+    logger.info(
+        "Writing batch directly to Elasticsearch (Kafka unavailable)",
+        batch_id=batch_id,
+        count=len(batch.logs),
+        path="direct_es",
+    )
+
     try:
         stored_entries = await store.add_batch(batch.logs)
 
         logger.info(
-            "Batch ingested successfully",
+            "Batch written directly to Elasticsearch",
             batch_id=batch_id,
             ingested=len(stored_entries),
         )
@@ -94,25 +156,25 @@ async def ingest_logs(
 
     except Exception as e:
         logger.error(
-            "Failed to ingest batch",
+            "Both Kafka and Elasticsearch are unavailable",
             batch_id=batch_id,
             error=str(e),
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to ingest logs: {str(e)}",
+            detail=f"Failed to ingest logs: storage unavailable. Error: {str(e)}",
         )
 
 
 @router.get(
     "/stats",
     summary="Get ingestion statistics",
-    description="Returns total ingested log counts, level breakdown, and top services.",
+    description="Returns total log counts, level breakdown, and top services from Elasticsearch.",
 )
 async def get_ingestion_stats(
-    store: InMemoryLogStore = Depends(get_log_store),
+    store=Depends(get_log_store),
 ) -> dict:
-    """Return statistics about ingested logs."""
+    """Return statistics about all ingested logs."""
     stats = await store.get_stats()
 
     logger.info("Stats requested", stats=stats)

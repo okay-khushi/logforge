@@ -15,7 +15,7 @@ pydantic-settings>=2.2.1  # Load settings from .env files with Pydantic v2
 python-dotenv>=1.0.1      # Read .env files into environment variables
 
 # ── Elasticsearch ─────────────────────────────────────────────────────────────
-elasticsearch[async]>=8.13.0  # Official async Elasticsearch client for Python
+elasticsearch[async]>=8.13.0,<9.0.0  # Must match server major version (ES 8.11.0)
 
 # ── Kafka ─────────────────────────────────────────────────────────────────────
 aiokafka>=0.10.0          # Async Kafka client (producer + consumer)

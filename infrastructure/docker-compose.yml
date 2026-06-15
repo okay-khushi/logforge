@@ -1,8 +1,22 @@
 # Docker Compose — LogForge Local Development
-# Phase 1: Infrastructure services only (Elasticsearch + Kafka + Zookeeper)
-# Full application services added in Phase 10
+# Phase 3: Added FastAPI backend service (connects to Elasticsearch)
+#
+# SERVICES:
+#   logforge-api       → FastAPI backend (port 8000)
+#   logforge-elasticsearch → ES 8.11 single-node (port 9200)
+#   logforge-kibana    → ES browser UI (port 5601)
+#   logforge-zookeeper → Required by Kafka (port 2181)
+#   logforge-kafka     → Message broker (port 9092)
+#   logforge-kafka-ui  → Kafka browser UI (port 8080)
+#   logforge-postgres  → Alert/rules metadata store (port 5432)
+#
+# USAGE:
+#   Start everything:  docker-compose -f infrastructure/docker-compose.yml up -d
+#   Start ES only:     docker-compose -f infrastructure/docker-compose.yml up -d elasticsearch
+#   View logs:         docker-compose -f infrastructure/docker-compose.yml logs -f logforge-api
 
-version: "3.9"
+
+
 
 services:
 
@@ -25,6 +39,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 40s   # Give ES time to start before first health check
     networks:
       - logforge-net
 
@@ -41,6 +56,40 @@ services:
         condition: service_healthy
     networks:
       - logforge-net
+
+  # ─── FastAPI Backend (Phase 3) ─────────────────────────────────────────────
+  # Connected to Elasticsearch — Phase 4 adds Kafka connection
+  logforge-api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: logforge-api
+    env_file:
+      - ../.env                             # Load from root .env
+    environment:
+      # Override specific values for Docker networking
+      # Inside Docker, services communicate via container name, not localhost
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - POSTGRES_HOST=postgres
+      - APP_ENV=development
+      - DEBUG=true
+    ports:
+      - "8000:8000"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy           # Don't start API until ES is ready
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health/live || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - logforge-net
+    volumes:
+      - ../backend/app:/app/app             # Hot-reload source in development
+                                            # REMOVE this line in production builds
 
   # ─── Zookeeper (required by Kafka) ─────────────────────────────────────────
   zookeeper:

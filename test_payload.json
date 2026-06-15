@@ -1,0 +1,28 @@
+{
+  "logs": [
+    {
+      "level": "ERROR",
+      "service": "payment-service",
+      "host": "prod-01",
+      "message": "Kafka pipeline test: charge failed for order ORD-9999",
+      "environment": "production",
+      "metadata": {"order_id": "ORD-9999", "user_id": "u42", "phase": "4"}
+    },
+    {
+      "level": "INFO",
+      "service": "auth-service",
+      "host": "prod-02",
+      "message": "Kafka pipeline test: user login successful",
+      "environment": "production",
+      "metadata": {"user_id": "u99", "phase": "4"}
+    },
+    {
+      "level": "WARN",
+      "service": "inventory-service",
+      "host": "prod-03",
+      "message": "Kafka pipeline test: stock level low for SKU-X100",
+      "environment": "staging",
+      "metadata": {"sku": "SKU-X100", "stock": 3}
+    }
+  ]
+}

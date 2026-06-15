@@ -1,56 +1,93 @@
 """
-services/log_store.py — In-Memory Log Storage (Phase 2 Stub)
+services/log_store.py — Log Store Protocol + Dependency Provider
 
-WHY AN IN-MEMORY STORE FOR PHASE 2?
-    We want a working, testable API before Elasticsearch is integrated (Phase 3).
-    This stub implements the exact same interface that the Elasticsearch service
-    will use later. When Phase 3 is complete, we swap this class out — the
-    routes don't need to change at all.
+Phase 3 Update: Added LogStoreProtocol and smart dependency routing.
 
-    This is the DEPENDENCY INJECTION pattern:
-    - Routes depend on an abstract interface (store logs, search logs)
-    - The concrete implementation (in-memory vs Elasticsearch) is injected
-    - Tests can inject a fake implementation without touching the real one
+THE DEPENDENCY INJECTION UPGRADE:
+    Phase 2: get_log_store() always returned InMemoryLogStore
+    Phase 3: get_log_store() returns ElasticsearchLogStore if ES is reachable,
+             falls back to InMemoryLogStore if ES is not available.
 
-    This is how every major FastAPI production codebase is structured.
+    The routes (ingest.py, search.py) don't know or care which store they get.
+    They just call await store.add_batch(...) and it works.
+
+PROTOCOL vs ABC:
+    We use typing.Protocol instead of ABC (Abstract Base Class) because:
+    - Protocol = structural subtyping ("duck typing" with type hints)
+    - A class satisfies the Protocol if it has the right methods — no need to
+      explicitly inherit from the Protocol
+    - This means InMemoryLogStore works as a LogStore without changing its code
 """
 
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Optional
-from uuid import uuid4
+from typing import Any, Optional, Protocol, runtime_checkable
 
 from app.core.logging import get_logger
 from app.models.log_entry import LogEntryInput, LogEntryStored
 
 logger = get_logger(__name__)
 
-# Maximum entries in the in-memory store
-# (Prevents unbounded memory growth in Phase 2 before ES is connected)
 MAX_IN_MEMORY_LOGS = 10_000
 
 
+# ── Protocol Definition ───────────────────────────────────────────────────────
+@runtime_checkable
+class LogStoreProtocol(Protocol):
+    """
+    The interface that all log store implementations must satisfy.
+
+    Any class with these async methods is a valid log store:
+    - InMemoryLogStore (Phase 2)
+    - ElasticsearchLogStore (Phase 3+)
+    - MockLogStore (for testing)
+
+    Runtime-checkable means isinstance(obj, LogStoreProtocol) works.
+    """
+
+    async def add_batch(self, entries: list[LogEntryInput]) -> list[LogEntryStored]:
+        """Store a batch of log entries. Returns the stored entries with IDs."""
+        ...
+
+    async def search(
+        self,
+        query: Optional[str],
+        level: Optional[str],
+        service: Optional[str],
+        environment: Optional[str],
+        from_time: Optional[datetime],
+        to_time: Optional[datetime],
+        page: int,
+        size: int,
+    ) -> dict[str, Any]:
+        """Search logs with optional filters. Returns paginated results."""
+        ...
+
+    async def get_stats(self) -> dict[str, Any]:
+        """Return statistics about stored logs."""
+        ...
+
+    async def health_check(self) -> dict[str, Any]:
+        """Return health status of the store."""
+        ...
+
+
+# ── InMemoryLogStore (Phase 2 fallback) ──────────────────────────────────────
 class InMemoryLogStore:
     """
     Temporary in-memory log store.
+    Used when Elasticsearch is not available (local dev without Docker).
 
-    Uses a deque (double-ended queue) for O(1) append and efficient
-    trimming of old entries when the max size is reached.
-
-    REPLACED IN PHASE 3 by ElasticsearchLogStore with the same interface.
+    REPLACED IN PRODUCTION by ElasticsearchLogStore (Phase 3).
+    Still useful for: unit tests, quick local demos, CI without Docker.
     """
 
     def __init__(self, max_size: int = MAX_IN_MEMORY_LOGS) -> None:
-        # deque with maxlen automatically drops the oldest entry when full
         self._store: deque[LogEntryStored] = deque(maxlen=max_size)
         self._total_ingested: int = 0
         logger.info("InMemoryLogStore initialized", max_size=max_size)
 
     async def add_batch(self, entries: list[LogEntryInput]) -> list[LogEntryStored]:
-        """
-        Validate and store a batch of log entries.
-        Returns the stored entries with their assigned IDs.
-        """
         stored_entries: list[LogEntryStored] = []
 
         for entry in entries:
@@ -61,10 +98,9 @@ class InMemoryLogStore:
         self._total_ingested += len(stored_entries)
 
         logger.info(
-            "Logs stored",
+            "Logs stored in memory",
             count=len(stored_entries),
             total_in_store=len(self._store),
-            total_ingested_all_time=self._total_ingested,
         )
 
         return stored_entries
@@ -74,20 +110,14 @@ class InMemoryLogStore:
         query: Optional[str] = None,
         level: Optional[str] = None,
         service: Optional[str] = None,
+        environment: Optional[str] = None,
         from_time: Optional[datetime] = None,
         to_time: Optional[datetime] = None,
         page: int = 1,
         size: int = 50,
     ) -> dict[str, Any]:
-        """
-        Simple in-memory search with filtering.
-
-        NOTE: This is O(n) — fine for Phase 2 testing but
-        Elasticsearch (Phase 3) makes this O(log n) with inverted indexes.
-        """
         results = list(self._store)
 
-        # Filter by text query (case-insensitive substring match)
         if query:
             query_lower = query.lower()
             results = [
@@ -97,28 +127,27 @@ class InMemoryLogStore:
                 or query_lower in r.host.lower()
             ]
 
-        # Filter by log level
         if level:
             results = [r for r in results if r.level == level.upper()]
 
-        # Filter by service name
         if service:
             results = [r for r in results if r.service == service.lower()]
 
-        # Filter by time range
-        if from_time:
-            results = [r for r in results if r.timestamp >= from_time]
-        if to_time:
-            results = [r for r in results if r.timestamp <= to_time]
+        if environment:
+            results = [r for r in results if r.environment.lower() == environment.lower()]
 
-        # Sort by timestamp descending (newest first)
+        if from_time:
+            from_time_aware = from_time.replace(tzinfo=timezone.utc) if from_time.tzinfo is None else from_time
+            results = [r for r in results if r.timestamp >= from_time_aware]
+        if to_time:
+            to_time_aware = to_time.replace(tzinfo=timezone.utc) if to_time.tzinfo is None else to_time
+            results = [r for r in results if r.timestamp <= to_time_aware]
+
         results.sort(key=lambda r: r.timestamp, reverse=True)
 
-        # Paginate
         total = len(results)
         start = (page - 1) * size
-        end = start + size
-        paginated = results[start:end]
+        paginated = results[start:start + size]
 
         return {
             "total": total,
@@ -128,7 +157,6 @@ class InMemoryLogStore:
         }
 
     async def get_stats(self) -> dict[str, Any]:
-        """Return basic statistics about stored logs."""
         all_logs = list(self._store)
 
         level_counts: dict[str, int] = {}
@@ -148,7 +176,6 @@ class InMemoryLogStore:
         }
 
     async def health_check(self) -> dict[str, Any]:
-        """Return health status of the store."""
         return {
             "status": "healthy",
             "type": "in_memory",
@@ -157,25 +184,41 @@ class InMemoryLogStore:
         }
 
 
-# ─── Singleton instance ────────────────────────────────────────────────────────
-# FastAPI's Depends() system will inject this into routes.
-# In Phase 3 we'll replace this with an Elasticsearch-backed store.
-_log_store = InMemoryLogStore()
+# ── Singleton instances ────────────────────────────────────────────────────────
+_in_memory_store: Optional[InMemoryLogStore] = None
+
+# The active store (set during app startup in main.py)
+# This is the ONLY place where the concrete implementation is chosen.
+_active_store: Optional[Any] = None
 
 
-def get_log_store() -> InMemoryLogStore:
+def set_active_store(store: Any) -> None:
     """
-    FastAPI dependency — returns the singleton log store.
-
-    Usage in routes:
-        from fastapi import Depends
-        from app.services.log_store import get_log_store, InMemoryLogStore
-
-        @router.post("/ingest")
-        async def ingest(
-            batch: LogBatchInput,
-            store: InMemoryLogStore = Depends(get_log_store)
-        ):
-            await store.add_batch(batch.logs)
+    Called from main.py startup to set the active store.
+    Either an ElasticsearchLogStore or InMemoryLogStore.
     """
-    return _log_store
+    global _active_store
+    _active_store = store
+    logger.info(
+        "Active log store set",
+        store_type=type(store).__name__,
+    )
+
+
+def get_log_store() -> Any:
+    """
+    FastAPI Depends() function — returns the active log store.
+
+    Priority:
+    1. ElasticsearchLogStore (if ES connected, set during startup)
+    2. InMemoryLogStore (fallback if ES not available)
+    """
+    global _active_store, _in_memory_store
+
+    if _active_store is not None:
+        return _active_store
+
+    # Fallback: create in-memory store if nothing set yet
+    if _in_memory_store is None:
+        _in_memory_store = InMemoryLogStore()
+    return _in_memory_store
